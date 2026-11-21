@@ -1,0 +1,522 @@
+# Shared deploy workflow for UB services. Every UB repo's deploy workflow
+# calls this one, pinned to a tag:
+#   uses: bpriddy/ub-workflows/.github/workflows/deploy-service.yml@v1
+# Usage and a caller example: docs/deploy-service.md.
+#
+# This repo is public. It holds no project ids, project numbers, service
+# accounts or WIF provider paths: the caller passes them (`targets`,
+# `registry`) or sets them on its GitHub Environments. The workflow runs with
+# the caller's own variables, secrets and OIDC token.
+#
+# One image, promoted:
+#   - Called WITHOUT image_digest (dev, or stage until dev exists): builds the
+#     caller repo's image once, pushes it to the shared Artifact Registry and
+#     deploys it. Outputs the digest.
+#   - Called WITH image_digest (stage, prod): deploys that exact image by
+#     digest. Never rebuilds. prod refuses to build at all.
+#   - The job runs in the GitHub Environment named by `environment`, so prod's
+#     required reviewer gates it. (A job that calls a reusable workflow cannot
+#     set `environment:` itself, so it is set here from the input.)
+#
+# Auth per environment: GCP_PROJECT_ID, GCP_WORKLOAD_IDENTITY_PROVIDER and
+# GCP_SERVICE_ACCOUNT_EMAIL come from the caller's Environment variables. The
+# caller's `targets` input maps dev, stage and prod to three different
+# projects. The "Check target" step refuses a project, provider or service
+# account that is not the target environment's, so a stage Environment that
+# is missing a variable can never fall back to the repo-level (prod) value.
+#
+# Rollback: in dev and stage, a failure after anything changed puts the
+# service's traffic back on the revision that was serving before, and puts
+# each job touched back on its previous image. In prod the job only fails and
+# prints the rollback commands; it never acts on its own.
+#
+# Deploys never CREATE a service or job: every target must already exist
+# (provisioning is Terraform's job).
+
+name: Deploy service (shared)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub Environment and target, one of dev, stage, prod.
+        type: string
+        required: true
+      service:
+        description: Cloud Run service or job name in this environment (e.g. my-api-stage).
+        type: string
+        required: true
+      kind:
+        description: "service (Cloud Run service) or job (Cloud Run job)."
+        type: string
+        default: service
+      region:
+        description: Cloud Run region. Empty means vars.GCP_REGION, then us-central1.
+        type: string
+        default: ''
+      image_digest:
+        description: "sha256:... of an image already in the registry. Set it to promote; leave it empty to build."
+        type: string
+        default: ''
+      targets:
+        description: >-
+          JSON map of each environment to its GCP project, all three required
+          and all different, e.g.
+          {"dev":{"project_id":"my-dev","project_number":"111"},"stage":{...},"prod":{...}}.
+          Pass it from the caller's workflow (a literal or a repo-level
+          variable), never from an Environment variable.
+        type: string
+        required: true
+      registry:
+        description: Artifact Registry host and project shared by all environments, e.g. us-central1-docker.pkg.dev/my-project.
+        type: string
+        required: true
+      repository:
+        description: Artifact Registry repository. Empty means the caller repo's name.
+        type: string
+        default: ''
+      image_name:
+        description: Image name inside the repository. Empty means the caller repo's name. Use the same value for build and promote.
+        type: string
+        default: ''
+      dockerfile:
+        description: Dockerfile path, relative to the repo root.
+        type: string
+        default: Dockerfile
+      context:
+        description: Docker build context.
+        type: string
+        default: .
+      build_args:
+        description: Docker build args, one NAME=value per line.
+        type: string
+        default: ''
+      flags:
+        description: >-
+          gcloud run deploy / gcloud run jobs deploy flags, one argument per
+          line, passed verbatim (lines starting with # are skipped, one pair of
+          surrounding double quotes is dropped). The
+          placeholders ${PROJECT_ID} ${PROJECT_NUMBER} ${REGION}
+          ${ENVIRONMENT} ${SERVICE} ${IMAGE} are replaced. If a line is
+          --image=${IMAGE} (multi-container services), no top-level --image
+          is added.
+        type: string
+        default: ''
+      migrate_job:
+        description: Cloud Run job that runs migrations before the deploy (updated to the new image, then executed with --wait). Empty means no migration.
+        type: string
+        default: ''
+      migrate_flags:
+        description: Flags for the migrate job, same format as flags.
+        type: string
+        default: ''
+      extra_jobs:
+        description: >-
+          JSON array of Cloud Run jobs that share the image and are updated
+          (never executed) after the deploy, e.g.
+          [{"name":"${SERVICE}-cleanup","flags":["--command=node","--args=dist/scripts/cleanup.js"]}].
+          Placeholders work in name and flags.
+        type: string
+        default: '[]'
+      health_path:
+        description: Services only. Path that must answer 200 after traffic moves (e.g. /health). Empty means Cloud Run's own readiness (startup probe) is the only check.
+        type: string
+        default: ''
+      health_auth:
+        description: "id-token (send the deploy SA's ID token; the SA needs run.invoker) or none."
+        type: string
+        default: id-token
+      health_timeout_seconds:
+        description: How long the health path may take to answer 200.
+        type: number
+        default: 90
+      timeout_minutes:
+        description: Job timeout.
+        type: number
+        default: 30
+    secrets:
+      GH_PACKAGES_TOKEN:
+        description: read:packages token, passed to the build as the BuildKit secret gh_packages_token. Optional.
+        required: false
+    outputs:
+      image_digest:
+        description: Digest of the deployed image (sha256:...). Pass it to the next environment's call.
+        value: ${{ jobs.deploy.outputs.image_digest }}
+      image:
+        description: Full image reference, <registry>/<repository>/<image_name>@<digest>.
+        value: ${{ jobs.deploy.outputs.image }}
+      revision:
+        description: Cloud Run revision now serving (services only).
+        value: ${{ jobs.deploy.outputs.revision }}
+      url:
+        description: Service URL (services only).
+        value: ${{ jobs.deploy.outputs.url }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: ${{ inputs.environment }} / ${{ inputs.service }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    environment:
+      name: ${{ inputs.environment }}
+    concurrency:
+      group: ub-deploy-${{ inputs.environment }}-${{ inputs.service }}
+      cancel-in-progress: false
+    outputs:
+      image_digest: ${{ steps.image.outputs.digest }}
+      image: ${{ steps.image.outputs.ref }}
+      revision: ${{ steps.deploy.outputs.revision }}
+      url: ${{ steps.target.outputs.url }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      SERVICE: ${{ inputs.service }}
+      KIND: ${{ inputs.kind }}
+      REGION: ${{ inputs.region || vars.GCP_REGION || 'us-central1' }}
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      DEPLOY_SA: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+      IMAGE_DIGEST_IN: ${{ inputs.image_digest }}
+      REGISTRY: ${{ inputs.registry }}
+      AR_REPOSITORY: ${{ inputs.repository }}
+      IMAGE_NAME: ${{ inputs.image_name }}
+    steps:
+      # Before any checkout or credential. Every input goes through env: and
+      # is quoted, never interpolated into a script.
+      - name: Check inputs
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$REF" = "refs/heads/main" ] || fail "Deploys run only from refs/heads/main (got: $REF)."
+          case "$ENVIRONMENT" in dev|stage|prod) ;; *) fail "environment must be dev, stage or prod (got: $ENVIRONMENT)." ;; esac
+          case "$KIND" in service|job) ;; *) fail "kind must be service or job (got: $KIND)." ;; esac
+          [[ "$SERVICE" =~ ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$ ]] || fail "service is not a valid Cloud Run name: $SERVICE"
+          [[ "$REGISTRY" =~ ^[a-z0-9-]+-docker\.pkg\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || fail "registry must be <location>-docker.pkg.dev/<project> (got: $REGISTRY)."
+          if [ -n "$IMAGE_DIGEST_IN" ]; then
+            [[ "$IMAGE_DIGEST_IN" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "image_digest must be sha256:<64 hex> (got: $IMAGE_DIGEST_IN)."
+          elif [ "$ENVIRONMENT" = "prod" ]; then
+            fail "prod never builds: pass the image_digest that stage (or dev) deployed."
+          fi
+
+      # The project, WIF provider and deploy SA must all belong to the target
+      # environment's project. This is what stops an Environment with a
+      # missing variable from falling back to the repo-level prod values.
+      - name: Check target
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          # dev, stage and prod must all be given and must be three different
+          # projects, so no environment can resolve to another's project.
+          jq -e '
+            type == "object"
+            and (keys == ["dev", "prod", "stage"])
+            and all(.[];
+              type == "object"
+              and (.project_id | type == "string" and test("^[a-z][a-z0-9-]{4,28}[a-z0-9]$"))
+              and (.project_number | tostring | test("^[0-9]{6,20}$")))
+            and ([.[].project_id] | unique | length) == 3
+            and ([.[].project_number | tostring] | unique | length) == 3
+          ' <<<"$TARGETS" >/dev/null \
+            || fail "targets must map exactly dev, stage and prod to {project_id, project_number}, three different projects."
+          WANT_PROJECT=$(jq -r --arg e "$ENVIRONMENT" '.[$e].project_id' <<<"$TARGETS")
+          WANT_NUMBER=$(jq -r --arg e "$ENVIRONMENT" '.[$e].project_number | tostring' <<<"$TARGETS")
+          [ "$PROJECT_ID" = "$WANT_PROJECT" ] \
+            || fail "Environment '$ENVIRONMENT' has GCP_PROJECT_ID='$PROJECT_ID'; expected $WANT_PROJECT. Set it on the Environment."
+          [[ "$WIF_PROVIDER" == "projects/$WANT_NUMBER/locations/global/workloadIdentityPools/"* ]] \
+            || fail "Environment '$ENVIRONMENT' has no GCP_WORKLOAD_IDENTITY_PROVIDER in project $WANT_NUMBER (got: '${WIF_PROVIDER}'). Set it on the Environment."
+          [[ "$DEPLOY_SA" == *"@$WANT_PROJECT.iam.gserviceaccount.com" ]] \
+            || fail "Environment '$ENVIRONMENT' has no GCP_SERVICE_ACCOUNT_EMAIL in $WANT_PROJECT (got: '${DEPLOY_SA}'). Set it on the Environment."
+          {
+            echo "PROJECT_NUMBER=$WANT_NUMBER"
+            echo "LIB=$RUNNER_TEMP/ub-deploy-lib.sh"
+            echo "PREV_FILE=$RUNNER_TEMP/ub-deploy-prev-images.tsv"
+          } >> "$GITHUB_ENV"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          IMAGE_REPO="$REGISTRY/${AR_REPOSITORY:-$REPO_NAME}/${IMAGE_NAME:-$REPO_NAME}"
+          echo "IMAGE_REPO=$IMAGE_REPO" >> "$GITHUB_ENV"
+          echo "Deploying to $ENVIRONMENT ($PROJECT_ID/$REGION) as $DEPLOY_SA; image $IMAGE_REPO"
+
+      # Shared helpers for the steps below.
+      - name: Write helpers
+        run: |
+          cat > "$LIB" <<'EOF'
+          set -euo pipefail
+          # Replace the documented placeholders, and only those.
+          subst() {
+            local s=$1
+            s=${s//'${PROJECT_ID}'/"$PROJECT_ID"}
+            s=${s//'${PROJECT_NUMBER}'/"$PROJECT_NUMBER"}
+            s=${s//'${REGION}'/"$REGION"}
+            s=${s//'${ENVIRONMENT}'/"$ENVIRONMENT"}
+            s=${s//'${SERVICE}'/"$SERVICE"}
+            s=${s//'${IMAGE}'/"${IMAGE_REF:-}"}
+            printf '%s' "$s"
+          }
+          # lines_to_array NAME <<<"$TEXT": one array element per non-blank,
+          # non-comment line, trimmed, placeholders replaced. Never eval'd.
+          lines_to_array() {
+            local -n _out=$1
+            _out=()
+            local line
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line#"${line%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
+              [ -z "$line" ] && continue
+              [[ $line == \#* ]] && continue
+              # One pair of surrounding double quotes is dropped, so lines
+              # copied from a bash FLAGS=( "..." ) array work unchanged.
+              if [[ $line == \"*\" ]] && [ ${#line} -ge 2 ]; then line=${line:1:${#line}-2}; fi
+              _out+=("$(subst "$line")")
+            done
+          }
+          job_image() {
+            gcloud run jobs describe "$1" --region "$REGION" --format=json \
+              | jq -r '.spec.template.spec.template.spec.containers[0].image // .template.template.containers[0].image // empty'
+          }
+          EOF
+
+      - uses: actions/checkout@v4
+        if: inputs.image_digest == ''
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      # Every target must exist already; record what each one runs now so a
+      # failure can put it back.
+      - id: target
+        name: Verify targets exist and record current state
+        env:
+          MIGRATE_JOB: ${{ inputs.migrate_job }}
+          EXTRA_JOBS: ${{ inputs.extra_jobs }}
+        run: |
+          # shellcheck source=/dev/null
+          source "$LIB"
+          fail() { echo "::error::$1 does not exist in $PROJECT_ID/$REGION. Provision it deliberately first (Terraform)."; exit 1; }
+          : > "$PREV_FILE"
+          record_job() {
+            gcloud run jobs describe "$1" --region "$REGION" --format='value(metadata.name)' >/dev/null || fail "Cloud Run job $1"
+            printf '%s\t%s\n' "$1" "$(job_image "$1")" >> "$PREV_FILE"
+          }
+          if [ "$KIND" = service ]; then
+            gcloud run services describe "$SERVICE" --region "$REGION" --format='value(metadata.name)' >/dev/null || fail "Cloud Run service $SERVICE"
+            PREV=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.latestReadyRevisionName)')
+            URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')
+            echo "prev_revision=$PREV" >> "$GITHUB_OUTPUT"
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            echo "Service $SERVICE serves $PREV at $URL"
+          else
+            record_job "$SERVICE"
+          fi
+          [ -z "$MIGRATE_JOB" ] || record_job "$(subst "$MIGRATE_JOB")"
+          jq -e 'type == "array" and all(.[]; (.name | type) == "string")' <<<"$EXTRA_JOBS" >/dev/null \
+            || { echo "::error::extra_jobs must be a JSON array of {name, flags}."; exit 1; }
+          while IFS= read -r name; do
+            record_job "$(subst "$name")"
+          done < <(jq -r '.[].name' <<<"$EXTRA_JOBS")
+          echo "Jobs and their current images:"; cat "$PREV_FILE"
+
+      - name: Configure Docker for Artifact Registry
+        if: inputs.image_digest == ''
+        run: gcloud auth configure-docker "${REGISTRY%%/*}" --quiet
+
+      - name: Build and push image
+        if: inputs.image_digest == ''
+        env:
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          BUILD_ARGS: ${{ inputs.build_args }}
+        run: |
+          # shellcheck source=/dev/null
+          source "$LIB"
+          lines_to_array ARGS <<<"$BUILD_ARGS"
+          BUILD=(docker build -f "$DOCKERFILE" -t "$IMAGE_REPO:$GITHUB_SHA"
+            --label "org.opencontainers.image.revision=$GITHUB_SHA"
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY")
+          for a in "${ARGS[@]}"; do BUILD+=(--build-arg "$a"); done
+          # BuildKit ignores the secret when the Dockerfile doesn't mount it.
+          # shellcheck disable=SC2054 # the comma is part of one --secret value
+          [ -z "${GH_PACKAGES_TOKEN:-}" ] || BUILD+=(--secret id=gh_packages_token,env=GH_PACKAGES_TOKEN)
+          "${BUILD[@]}" "$CONTEXT"
+          docker push "$IMAGE_REPO:$GITHUB_SHA"
+          REPO_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE_REPO:$GITHUB_SHA")
+          echo "BUILT_DIGEST=${REPO_DIGEST##*@}" >> "$GITHUB_ENV"
+
+      # From here on the image is only ever named by digest.
+      - id: image
+        name: Resolve image by digest
+        run: |
+          set -euo pipefail
+          DIGEST="${IMAGE_DIGEST_IN:-${BUILT_DIGEST:-}}"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest (got: '$DIGEST')."; exit 1; }
+          REF="$IMAGE_REPO@$DIGEST"
+          # Fails if the digest isn't in the registry or this environment's
+          # deploy SA can't read it.
+          gcloud artifacts docker images describe "$REF" --format='value(image_summary.fully_qualified_digest)'
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_REF=$REF" >> "$GITHUB_ENV"
+
+      - name: Run migrations
+        if: inputs.migrate_job != ''
+        env:
+          MIGRATE_JOB: ${{ inputs.migrate_job }}
+          MIGRATE_FLAGS: ${{ inputs.migrate_flags }}
+        run: |
+          # shellcheck source=/dev/null
+          source "$LIB"
+          JOB=$(subst "$MIGRATE_JOB")
+          lines_to_array FLAGS <<<"$MIGRATE_FLAGS"
+          gcloud run jobs deploy "$JOB" --image "$IMAGE_REF" --region "$REGION" --quiet "${FLAGS[@]}"
+          gcloud run jobs execute "$JOB" --region "$REGION" --wait
+
+      # Services: create the new revision with no traffic (a revision that
+      # never becomes ready fails here and changes nothing), then move 100%
+      # of traffic to it.
+      - id: deploy
+        name: Deploy
+        env:
+          DEPLOY_FLAGS: ${{ inputs.flags }}
+        run: |
+          # shellcheck source=/dev/null
+          source "$LIB"
+          lines_to_array FLAGS <<<"$DEPLOY_FLAGS"
+          IMAGE_ARG=(--image "$IMAGE_REF")
+          for f in "${FLAGS[@]}"; do
+            if [ "$f" = "--image=$IMAGE_REF" ]; then IMAGE_ARG=(); fi
+          done
+          if [ "$KIND" = service ]; then
+            gcloud run deploy "$SERVICE" "${IMAGE_ARG[@]}" --region "$REGION" --platform managed --no-traffic --quiet "${FLAGS[@]}"
+            NEW=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.latestCreatedRevisionName)')
+            READY=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.latestReadyRevisionName)')
+            [ "$NEW" = "$READY" ] || { echo "::error::revision $NEW is not ready (latest ready: $READY)."; exit 1; }
+            echo "traffic_moved=true" >> "$GITHUB_OUTPUT"
+            gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-latest --quiet
+            echo "revision=$NEW" >> "$GITHUB_OUTPUT"
+            echo "Revision $NEW now serves 100%"
+          else
+            gcloud run jobs deploy "$SERVICE" "${IMAGE_ARG[@]}" --region "$REGION" --quiet "${FLAGS[@]}"
+          fi
+
+      - id: health_token
+        name: Mint ID token for the health check
+        if: inputs.kind == 'service' && inputs.health_path != '' && inputs.health_auth == 'id-token'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+          token_format: id_token
+          id_token_audience: ${{ steps.target.outputs.url }}
+          id_token_include_email: true
+          create_credentials_file: false
+
+      - name: Health check
+        if: inputs.kind == 'service' && inputs.health_path != ''
+        env:
+          URL: ${{ steps.target.outputs.url }}
+          HEALTH_PATH: ${{ inputs.health_path }}
+          HEALTH_TIMEOUT: ${{ inputs.health_timeout_seconds }}
+          ID_TOKEN: ${{ steps.health_token.outputs.id_token }}
+        run: |
+          set -euo pipefail
+          AUTH=()
+          [ -z "${ID_TOKEN:-}" ] || AUTH=(-H "Authorization: Bearer $ID_TOKEN")
+          DEADLINE=$(( $(date +%s) + HEALTH_TIMEOUT ))
+          while :; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "${AUTH[@]}" "$URL$HEALTH_PATH" || true)
+            [ "$CODE" = 200 ] && { echo "$URL$HEALTH_PATH answered 200"; break; }
+            [ "$(date +%s)" -lt "$DEADLINE" ] || { echo "::error::$URL$HEALTH_PATH answered $CODE, not 200, for ${HEALTH_TIMEOUT}s."; exit 1; }
+            sleep 5
+          done
+
+      - name: Update jobs that share the image
+        env:
+          EXTRA_JOBS: ${{ inputs.extra_jobs }}
+        run: |
+          # shellcheck source=/dev/null
+          source "$LIB"
+          COUNT=$(jq 'length' <<<"$EXTRA_JOBS")
+          for i in $(seq 0 $(( COUNT - 1 ))); do
+            JOB=$(subst "$(jq -r ".[$i].name" <<<"$EXTRA_JOBS")")
+            FLAGS=()
+            while IFS= read -r f; do FLAGS+=("$(subst "$f")"); done < <(jq -r ".[$i].flags[]?" <<<"$EXTRA_JOBS")
+            gcloud run jobs deploy "$JOB" --image "$IMAGE_REF" --region "$REGION" --quiet "${FLAGS[@]}"
+          done
+
+      # dev and stage only. Traffic goes back to the revision that served
+      # before; each job goes back to its previous image (its other settings
+      # keep this run's flags).
+      - name: Roll back (dev and stage)
+        if: (failure() || cancelled()) && inputs.environment != 'prod' && steps.target.outcome == 'success'
+        env:
+          PREV_REVISION: ${{ steps.target.outputs.prev_revision }}
+          TRAFFIC_MOVED: ${{ steps.deploy.outputs.traffic_moved }}
+        run: |
+          # shellcheck source=/dev/null
+          source "$LIB"
+          set +e
+          RC=0
+          if [ "$KIND" = service ] && [ "$TRAFFIC_MOVED" = true ] && [ -n "$PREV_REVISION" ]; then
+            echo "Moving 100% of $SERVICE's traffic back to $PREV_REVISION"
+            gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-revisions="$PREV_REVISION=100" --quiet || RC=1
+          fi
+          while IFS=$'\t' read -r JOB PREV_IMAGE; do
+            if [ -z "$JOB" ] || [ -z "$PREV_IMAGE" ]; then continue; fi
+            NOW=$(job_image "$JOB")
+            if [ "$NOW" != "$PREV_IMAGE" ]; then
+              echo "Putting job $JOB back on $PREV_IMAGE"
+              gcloud run jobs update "$JOB" --image "$PREV_IMAGE" --region "$REGION" --quiet || RC=1
+            fi
+          done < "$PREV_FILE"
+          {
+            echo "### $ENVIRONMENT deploy of $SERVICE failed"
+            echo "Image: \`${IMAGE_REF:-not resolved}\`. Whatever this run changed was put back: traffic on ${PREV_REVISION:-the previous revision}, jobs on their previous images (rollback exit $RC)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $RC
+
+      # prod: never act on our own. Say exactly what a person can run.
+      - name: Rollback commands (prod, not run)
+        if: (failure() || cancelled()) && inputs.environment == 'prod' && steps.target.outcome == 'success'
+        env:
+          PREV_REVISION: ${{ steps.target.outputs.prev_revision }}
+        run: |
+          {
+            echo "### prod deploy of $SERVICE failed. Nothing was rolled back automatically."
+            echo "If a rollback is needed, run:"
+            echo '```'
+            if [ "$KIND" = service ] && [ -n "$PREV_REVISION" ]; then
+              echo "gcloud run services update-traffic $SERVICE --project $PROJECT_ID --region $REGION --to-revisions=$PREV_REVISION=100"
+            fi
+            while IFS=$'\t' read -r JOB PREV_IMAGE; do
+              if [ -z "$JOB" ] || [ -z "$PREV_IMAGE" ]; then continue; fi
+              echo "gcloud run jobs update $JOB --project $PROJECT_ID --region $REGION --image $PREV_IMAGE"
+            done < "$PREV_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary
+        env:
+          REVISION: ${{ steps.deploy.outputs.revision }}
+          URL: ${{ steps.target.outputs.url }}
+        run: |
+          {
+            echo "### Deployed $SERVICE to $ENVIRONMENT"
+            echo "- image: \`$IMAGE_REF\`"
+            [ -z "$REVISION" ] || echo "- revision: \`$REVISION\` (100% traffic)"
+            [ -z "$URL" ] || echo "- url: $URL"
+          } >> "$GITHUB_STEP_SUMMARY"
